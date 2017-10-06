@@ -50,10 +50,11 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     tornado
 
 ########## INSTALLATION STEPS ###################
-RUN git clone --branch v0.8.1 --recursive https://github.com/caffe2/caffe2.git
+# RUN git clone --branch v0.8.1 --recursive https://github.com/caffe2/caffe2.git
+RUN git clone --branch master --recursive https://github.com/myelintek/caffe2.git
 RUN cd caffe2 && mkdir build && cd build \
     && cmake .. \
-    -DCUDA_ARCH_NAME=Manual \
+    -DCUDA_ARCH_NAME=Pascal \
     -DCUDA_ARCH_BIN="35 52 60 61" \
     -DCUDA_ARCH_PTX="61" \
     -DUSE_NNPACK=OFF \
