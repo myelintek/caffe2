@@ -22,6 +22,7 @@ set(CMAKE_FIND_NO_INSTALL_PREFIX TRUE)
 option(BUILD_BINARY "Build C++ binaries" ON)
 option(BUILD_PYTHON "Build Python binaries" ON)
 option(BUILD_SHARED_LIBS "Build libcaffe2.so" ON)
+option(BUILD_SHARE_DIR "Build files in the share/ directory" OFF)
 option(BUILD_TEST "Build C++ test binaries (need gtest and gbenchmark)" ON)
 option(USE_ATEN "Use ATen" OFF)
 option(USE_ASAN "Use Address Sanitizer" OFF)
@@ -62,7 +63,6 @@ include(ExternalProject)
 include(cmake/Utils.cmake)
 include(cmake/Summary.cmake)
 
-set(CAFFE2_CPU_FLAGS "" CACHE STRING "Flags to specify CPU features.")
 set(CAFFE2_WHITELIST "" CACHE STRING "A whitelist file of files that one should build.")
 
 # Set default build type
@@ -109,10 +109,6 @@ endif()
 
 if(NOT APPLE AND UNIX)
   list(APPEND Caffe2_DEPENDENCY_LIBS dl)
-endif()
-
-if (CAFFE2_CPU_FLAGS)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CAFFE2_CPU_FLAGS}")
 endif()
 
 # Prefix path to Caffe2 headers.

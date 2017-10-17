@@ -36,11 +36,19 @@ class ObserverConfig {
     return skipIters_;
   }
   static void setReporter(unique_ptr<NetObserverReporter> reporter) {
+    // Can only set the reporter once
+    CAFFE_ENFORCE(reporter_ == nullptr);
     reporter_ = std::move(reporter);
   }
   static NetObserverReporter* getReporter() {
     CAFFE_ENFORCE(reporter_);
     return reporter_.get();
+  }
+  static void setMarker(int marker) {
+    marker_ = marker;
+  }
+  static int getMarker() {
+    return marker_;
   }
 
  private:
@@ -55,6 +63,9 @@ class ObserverConfig {
   static int skipIters_;
 
   static unique_ptr<NetObserverReporter> reporter_;
+
+  /* marker used in identifying the metrics in certain reporters */
+  static int marker_;
 };
 
 }

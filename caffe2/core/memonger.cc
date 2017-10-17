@@ -293,13 +293,25 @@ class ComputeBlobRecyclingForDag {
       Argument* arg = op->mutable_arg(i);
       const string& name = arg->name();
       if (name == "step_net" || name == "backward_step_net") {
-        NetDef step_net;
-        CAFFE_ENFORCE(
-            google::protobuf::TextFormat::ParseFromString(arg->s(), &step_net),
-            "Could not parse step net:",
-            name);
-        step_net = apply_assignments(step_net);
-        arg->set_s(ProtoDebugString(step_net));
+        if (arg->has_n()) {
+          NetDef* step_net_ref = arg->mutable_n();
+          CAFFE_ENFORCE(
+              !arg->has_s(),
+              "Invalid definition for ",
+              name,
+              ". Only one of NetDef and string should be present");
+          NetDef optimized_net = apply_assignments(*step_net_ref);
+          step_net_ref->CopyFrom(optimized_net);
+        } else {
+          NetDef step_net;
+          CAFFE_ENFORCE(
+              google::protobuf::TextFormat::ParseFromString(
+                  arg->s(), &step_net),
+              "Could not parse step net:",
+              name);
+          step_net = apply_assignments(step_net);
+          arg->set_s(ProtoDebugString(step_net));
+        }
       }
     }
 
