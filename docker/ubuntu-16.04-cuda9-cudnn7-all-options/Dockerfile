@@ -1,7 +1,8 @@
 FROM nvidia/cuda:9.0-cudnn7-devel-ubuntu16.04
 LABEL maintainer="simon.s.chuang@gmail.com"
 
-ENV CAFFE2 ${CAFFE2:-master}
+ARG CAFFE2=master
+ENV CAFFE2=${CAFFE2}
 
 # caffe2 install with gpu support
 
