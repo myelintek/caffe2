@@ -71,6 +71,9 @@ RUN git clone -b ${CAFFE2_VERSION} --depth 1 --recursive https://github.com/myel
     cd .. && \
     rm -rf build
 
+RUN mkdir /workspace && \
+    cp -rf /opt/caffe2/caffe2/python/tutorials/* /workspace/
+
 WORKDIR /workspace
 ENV PYTHONPATH /usr/local
 
