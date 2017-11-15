@@ -62,6 +62,11 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --upgrade git+https://github.com/Maratyszcza/confu
 
 ########## INSTALLATION STEPS ###################
+RUN wget -O libnccl2.deb https://www.dropbox.com/s/n1vx60mqj8hi2ij/libnccl2.deb?dl=0 && \
+    wget -O libnccl-dev.deb https://www.dropbox.com/s/lkh26o02vq6802y/libnccl-dev.deb?dl=0 && \
+    dpkg -i libnccl2.deb && \
+    dpkg -i libnccl-dev.deb
+
 RUN git clone -b ${CAFFE2_VERSION} --depth 1 --recursive https://github.com/myelintek/caffe2.git . && \
     mkdir build && cd build && \
     cmake -DCUDA_ARCH_NAME=Pascal -DCUDA_ARCH_BIN="61" -DCUDA_ARCH_PTX="61" -DUSE_NNPACK=ON -DUSE_ROCKSDB=OFF -DUSE_NCCL=ON .. && \
