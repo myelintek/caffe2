@@ -149,7 +149,6 @@ void CUDARecurrentNetworkExecutor::_ExecRange(int from, int to) {
   }
 }
 
-
 bool CUDARecurrentNetworkExecutor::Run(int T) {
   _ExecRange(0, T);
   return true;

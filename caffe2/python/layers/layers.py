@@ -52,6 +52,10 @@ def get_categorical_limit(record):
     return key.metadata.categorical_limit
 
 
+def get_avg_length(record):
+    return record['lengths'].metadata.expected_value
+
+
 def set_request_only(field):
     for f in field.all_scalars():
         categorical_limit, expected_value = None, None
@@ -321,13 +325,17 @@ class ModelLayer(object):
                 init_net._net.op.extend([init_op])
 
     def create_param(self, param_name, shape, initializer, optimizer,
-                       ps_param=None):
+                     ps_param=None):
         with scope.NameScope(self.name, reset=True):
             param = self.model.create_param(param_name=param_name,
                                             shape=shape,
                                             initializer=initializer,
                                             optimizer=optimizer,
                                             ps_param=ps_param)
+
+            # make sure we don't share parameters in the same layer
+            assert all(param.parameter != p.parameter for p in self.params)
+
             self.params.append(param)
             return param.parameter
 

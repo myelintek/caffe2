@@ -18,6 +18,8 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import inspect
+
 import numpy as np
 
 from hypothesis import assume, given, settings
@@ -141,7 +143,7 @@ class TestMatMul(hu.HypothesisTestCase):
 class TestBatchMatMul(hu.HypothesisTestCase):
     @settings(max_examples=30)
     @given(
-        C=st.integers(min_value=1, max_value=10),
+        C=st.integers(min_value=0, max_value=3),  # number of batch dims
         M=st.integers(min_value=1, max_value=10),
         K=st.integers(min_value=1, max_value=10),
         N=st.integers(min_value=1, max_value=10),
@@ -156,39 +158,47 @@ class TestBatchMatMul(hu.HypothesisTestCase):
             assume(gc.device_type == caffe2_pb2.CUDA)
             dc = [d for d in dc if d.device_type == caffe2_pb2.CUDA]
 
-        X = np.random.rand(C, M, K).astype(dtype) - 0.5
+        batch_dims = np.random.randint(
+            low=1,
+            high=3,
+            size=C,
+            dtype=np.int64).tolist()
+        X = np.random.rand(*(batch_dims + [M, K])).astype(dtype) - 0.5
         if trans_a:
-            X = X.swapaxes(1, 2)
-
-        Y = np.random.rand(C, K, N).astype(dtype) - 0.5
+            X = X.swapaxes(-1, -2)
+        Y = np.random.rand(*(batch_dims + [K, N])).astype(dtype) - 0.5
         if trans_b:
-            Y = Y.swapaxes(1, 2)
+            Y = Y.swapaxes(-1, -2)
 
         op = core.CreateOperator(
             'BatchMatMul', ['X', 'Y'], 'out', trans_a=trans_a, trans_b=trans_b
         )
 
-        def matmul_ref(X, Y, trans_a, trans_b):
-            XX = X.swapaxes(1, 2) if trans_a else X
-            YY = Y.swapaxes(1, 2) if trans_b else Y
-            output = np.zeros((C, M, N)).astype(XX.dtype)
-            for i in range(C):
-                output[i] = XX[i].dot(YY[i])
-            return (output, )
+        def matmul_ref(X, Y, trans_a, trans_b, dtype):
+            XX = (X.swapaxes(-1, -2) if trans_a else X).astype(np.float32)
+            YY = (Y.swapaxes(-1, -2) if trans_b else Y).astype(np.float32)
+            return (np.matmul(XX, YY).astype(dtype),)
+
+        # relaxing the "threshold" for fp16 to 150x of the default
+        def relax_fp16_check(check_func, *args, **kwargs):
+            # inspect the default "threshold" value in check_func
+            argspec = inspect.getargspec(check_func)
+            threshold = argspec.defaults[
+                argspec.args.index('threshold') -
+                (len(argspec.args) - len(argspec.defaults))]
+
+            if dtype == np.float16:
+                threshold = 150 * threshold
+            check_func(*args, threshold=threshold, **kwargs)
 
         # Check against numpy reference
-        self.assertReferenceChecks(gc, op, [X, Y, trans_a, trans_b], matmul_ref)
+        relax_fp16_check(self.assertReferenceChecks, gc, op, [X, Y, trans_a, trans_b, dtype], matmul_ref)
         # Check over multiple devices
-        self.assertDeviceChecks(dc, op, [X, Y], [0])
-
-        kwargs = {}
-        if dtype == np.float16:
-            kwargs['threshold'] = 0.75  # default is 0.005
-
+        relax_fp16_check(self.assertDeviceChecks, dc, op, [X, Y], [0])
         # Gradient check wrt X
-        self.assertGradientChecks(gc, op, [X, Y], 0, [0], **kwargs)
+        relax_fp16_check(self.assertGradientChecks, gc, op, [X, Y], 0, [0])
         # Gradient check wrt Y
-        self.assertGradientChecks(gc, op, [X, Y], 1, [0], **kwargs)
+        relax_fp16_check(self.assertGradientChecks, gc, op, [X, Y], 1, [0])
 
 
 if __name__ == "__main__":

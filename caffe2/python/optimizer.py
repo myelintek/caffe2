@@ -238,12 +238,18 @@ class SgdOptimizer(Optimizer):
             self._aux_params.local.append(momentum_data)
 
         if isinstance(grad, core.GradientSlice):
-            assert self.momentum == 0., "Doesn't support momentum for sparse"
             grad = self.dedup(net, self.sparse_dedup_aggregator, grad)
-            net.ScatterWeightedSum(
-                [param, ONE, grad.indices, grad.values, lr],
-                param
-            )
+            if self.momentum > 0.:
+                net.SparseMomentumSGDUpdate(
+                    [grad.values, momentum_data, lr, param, grad.indices],
+                    [grad.values, momentum_data, param],
+                    momentum=self.momentum,
+                    nesterov=self.nesterov)
+            else:
+                net.ScatterWeightedSum(
+                    [param, ONE, grad.indices, grad.values, lr],
+                    param
+                )
         else:
             if self.momentum > 0.:
                 net.MomentumSGDUpdate(
@@ -318,6 +324,99 @@ class MultiPrecisionSgdOptimizer(SgdOptimizer):
         net.FloatToHalf(param_fp32, param)
 
 
+class FP16SgdOptimizer(SgdOptimizer):
+    def __init__(self, base_learning_rate=0.1, momentum=0.0,
+                 policy="fixed", nesterov=1, weight_decay=0.0001,
+                 sparse_dedup_aggregator=None,
+                 **kwargs):
+        super(SgdOptimizer, self).__init__()
+        self.base_learning_rate = base_learning_rate
+        self.momentum = momentum
+        self.policy = policy
+        self.nesterov = nesterov
+        self.sparse_dedup_aggregator = sparse_dedup_aggregator
+        self.init_kwargs = kwargs
+        self.weight_decay = weight_decay
+
+    def _run(self, net, param_init_net, param_info, fp32_update=False):
+
+        fp32_update_flag = 0
+        param_name = str(param_info.blob)
+
+        # should only be triggered in FP16 training by SpatialBN, which
+        # requires FP32 params in CuDNN.
+        if param_name.find("spatbn") != -1:
+            fp32_update = True
+
+        if fp32_update:
+            # doing a 32bit update
+            # Have to assume param_info.blob is FP32 as there is no way
+            # (that i currently know of) to query a blob's type in python
+            fp32_update_flag = 1
+            param = param_info.blob
+            param_fp32 = param_info.blob
+        else:
+            if param_info.blob_copy is None:
+                # doing a 32bit update
+                # Have to assume param_info.blob is FP32 as there is no way
+                # (that i currently know of) to query a blob's type in python
+                fp32_update_flag = 1
+                param = param_info.blob
+                param_fp32 = param_info.blob
+            else:
+                if core.DataType.FLOAT in param_info.blob_copy:
+                    param = param_info.blob
+                    param_fp32 = param_info.blob_copy[core.DataType.FLOAT]
+                elif core.DataType.FLOAT16 in param_info.blob_copy:
+                    param = param_info.blob_copy[core.DataType.FLOAT16]
+                    param_fp32 = param_info.blob
+                else:
+                    assert (False), (
+                        "Unrecognized parameter format to be updated "
+                        "by FP16 Optimizer. Parameter: {}".format(param_info.name)
+                    )
+
+        grad = param_info.grad
+
+        if self.base_learning_rate == 0:
+            return
+        assert self.base_learning_rate > 0
+
+        lr, _ = self.build_lr(
+            net, param_init_net,
+            base_learning_rate=-self.base_learning_rate,
+            policy=self.policy,
+            **(self.init_kwargs)
+        )
+
+        momentum_data_fp32 = param_init_net.ConstantFill(
+            param_fp32, str(param) + "_momentum_fp32", value=0.)
+
+        momentum_data = param_init_net.FloatToHalf(
+            momentum_data_fp32, str(param) + "_momentum")
+
+        self._aux_params.local.append(momentum_data)
+
+        assert not isinstance(grad, core.GradientSlice), \
+                "Doesn't support sparse gradients"
+
+        if fp32_update_flag == 0:
+            net.FP16MomentumSGDUpdate(
+                [grad, momentum_data, lr, param],
+                [grad, momentum_data, param],
+                momentum=self.momentum,
+                nesterov=self.nesterov,
+                weight_decay=self.weight_decay)
+        else:
+            # flag set to 1, therefore doing FP32 update
+            net.FP32MomentumSGDUpdate(
+                [grad, momentum_data_fp32, lr, param],
+                [grad, momentum_data_fp32, param],
+                momentum=self.momentum,
+                nesterov=self.nesterov,
+                weight_decay=self.weight_decay)
+
+
 class WeightDecayBuilder(Optimizer):
     def __init__(self, weight_decay):
         self.weight_decay = weight_decay
@@ -376,25 +475,30 @@ class AdagradOptimizer(Optimizer):
         )
 
         if self.rowWise:
-            shape = param_init_net.Shape(param, str(param) + "_shape")
-            slice_starts = np.array([0]).astype(np.int32)
-            slice_ends = np.array([1]).astype(np.int32)
-            slice_starts = param_init_net.GivenTensorIntFill(
-                [], shape=[1], values=slice_starts
-            )
-            slice_ends = param_init_net.GivenTensorIntFill(
-                [], shape=[1], values=slice_ends
-            )
-            num_rows = param_init_net.Slice(
-                [shape, slice_starts, slice_ends],
-                str(shape) + "_numrows"
-            )
-            param_squared_sum = param_init_net.ConstantFill(
-                num_rows,
-                str(param) + "_avg_squared_sum",
-                input_as_shape=1,
-                value=0.0
-            )
+            shapes, types = workspace.InferShapesAndTypes([param_init_net])
+            if str(param) not in shapes:
+                # Type/shape inference is not available for this param, fallback
+                # on Shape/Slice logic
+                shape = param_init_net.Shape(param, str(param) + "_shape")
+                num_rows = param_init_net.Slice(
+                    [shape],
+                    str(shape) + "_numrows",
+                    starts=[0], ends=[1]
+                )
+                param_squared_sum = param_init_net.ConstantFill(
+                    num_rows,
+                    str(param) + "_avg_squared_sum",
+                    input_as_shape=1,
+                    value=0.0
+                )
+            else:
+                param_squared_sum = param_init_net.ConstantFill(
+                    [],
+                    str(param) + "_avg_squared_sum",
+                    shape=[shapes[str(param)][0]],
+                    value=0.0
+                )
+
         else:
             param_squared_sum = param_init_net.ConstantFill(
                 [param],
@@ -406,7 +510,9 @@ class AdagradOptimizer(Optimizer):
 
         if self.rowWise:
             assert isinstance(grad, core.GradientSlice),\
-                'If SparseAdagrad with rowWise=True, gradient must be gradientslice'
+                'If SparseAdagrad with rowWise=True, gradient must be '\
+                'a gradientslice. PLease ensure that rowWise is not enabled '\
+                'for the dense Adagrad optimizer, as it is not supported.'
         if isinstance(grad, core.GradientSlice):
             assert self.decay == 1.,\
                 'Decay is not implemented for SparseAdagrad and must be set to 1'
@@ -679,6 +785,93 @@ class YellowFinOptimizer(Optimizer):
         return
 
 
+class RmsPropOptimizer(Optimizer):
+    def __init__(
+        self,
+        alpha=0.01,
+        decay=0.9,
+        momentum=0.0,
+        epsilon=1e-5,
+        policy='fixed',
+        engine='',
+        **kwargs
+    ):
+        super(RmsPropOptimizer, self).__init__()
+        self.alpha = alpha
+        self.decay = decay
+        self.momentum = momentum
+        self.epsilon = epsilon
+        self.policy = policy
+        self.engine = engine
+        self.init_kwargs = kwargs
+
+    def _run(self, net, param_init_net, param_info):
+        param = param_info.blob
+        grad = param_info.grad
+
+        assert self.alpha > 0
+        assert not isinstance(grad, core.GradientSlice), \
+            "RmsPropOptimizer doesn't support sparse gradients"
+
+        dev = scope.CurrentDeviceScope()
+        if dev is None:
+            dev = core.DeviceOption(caffe2_pb2.CPU)
+
+        ONE = param_init_net.ConstantFill(
+            [],
+            "ONE_{}_{}".format(dev.device_type, dev.cuda_gpu_id),
+            shape=[1],
+            value=1.0
+        )
+
+        lr, _ = self.build_lr(
+            net,
+            param_init_net,
+            base_learning_rate=-self.alpha,
+            policy=self.policy,
+            **(self.init_kwargs)
+        )
+
+        grad_o = param_init_net.ConstantFill(
+            [param],
+            str(param) + "_grad_o",
+            values=0.0,
+        )
+
+        ms = param_init_net.ConstantFill(
+            [param],
+            str(param) + "_mean_squares",
+            values=0.0,
+        )
+
+        mom = param_init_net.ConstantFill(
+            [param],
+            str(param) + "_momentum",
+            values=0.0,
+        )
+
+        self._aux_params.local.append(ms)
+        self._aux_params.local.append(mom)
+
+        net.RmsProp(
+            [grad, ms, mom, ONE],
+            [grad_o, ms, mom],
+            decay=self.decay,
+            momentum=self.momentum,
+            epsilon=self.epsilon,
+            engine=self.engine,
+        )
+
+        net.MomentumSGDUpdate(
+            [grad_o, mom, lr, param],
+            [grad_o, mom, param],
+        )
+
+    def scale_learning_rate(self, scale):
+        self.alpha *= scale
+        return
+
+
 def _get_param_to_device(model):
     # Infer blob devices by going through the net and param_init_net
     # ops and observing the device used to create or use the blob.
@@ -906,6 +1099,13 @@ def build_multi_precision_sgd(
     )
 
 
+def build_fp16_sgd(model, base_learning_rate, **kwargs):
+    fp16_sgd_optimizer = FP16SgdOptimizer(
+        base_learning_rate, **kwargs
+    )
+    return _build(model, fp16_sgd_optimizer)
+
+
 def build_ftrl(model, engine="SIMD", **kwargs):
     if engine == "SIMD":
         assert core.IsOperator('Ftrl_ENGINE_SIMD')
@@ -952,3 +1152,19 @@ def build_yellowfin(model, base_learning_rate=0.1, **kwargs):
         alpha=base_learning_rate,
         **kwargs)
     return _build(model, yellowfin_optimizer)
+
+
+def build_rms_prop(
+    model,
+    base_learning_rate,
+    max_gradient_norm=None,
+    allow_lr_injection=False,
+    **kwargs
+):
+    rms_prop_optimizer = RmsPropOptimizer(alpha=base_learning_rate, **kwargs)
+    return _build(
+        model,
+        rms_prop_optimizer,
+        max_gradient_norm=max_gradient_norm,
+        allow_lr_injection=allow_lr_injection,
+    )

@@ -404,6 +404,62 @@ class WeightedSumOp : public Operator<Context> {
   bool RunOnDevice() override;
 };
 
+template <class Context>
+class WeightedSumGradientOp : public Operator<Context> {
+ public:
+  USE_OPERATOR_CONTEXT_FUNCTIONS;
+
+  WeightedSumGradientOp(const OperatorDef& operator_def, Workspace* ws)
+      : Operator<Context>(operator_def, ws),
+        grad_on_w_(OperatorBase::GetSingleArgument<bool>("grad_on_w", false)) {}
+
+  template <typename DstType>
+  bool DoRunWithType() {
+    CAFFE_ENFORCE_EQ(InputSize() % 2, 1);
+    auto output_size = grad_on_w_ ? InputSize() - 1 : InputSize() / 2;
+    CAFFE_ENFORCE_EQ(OutputSize(), output_size);
+
+    auto& dY = Input(0);
+    const auto* dY_data = dY.template data<DstType>();
+    int size = dY.size();
+
+    // The input size should be the input size of the forward op plus 1
+    for (int i = 0; i < InputSize() / 2; i++) {
+      auto& cur_w = Input(2 * i + 2);
+      CAFFE_ENFORCE_EQ(cur_w.size(), 1);
+      auto* cur_dX = Output(i);
+      cur_dX->ResizeLike(dY);
+
+      math::Scale<DstType, Context>(
+          size,
+          cur_w.template data<float>(),
+          dY_data,
+          cur_dX->template mutable_data<DstType>(),
+          &context_);
+
+      if (grad_on_w_) {
+        auto& cur_X = Input(2 * i + 1);
+        CAFFE_ENFORCE_EQ(cur_X.size(), size);
+        auto* cur_dw = Output(i + output_size / 2);
+        cur_dw->Resize(1);
+        math::Dot<DstType, Context>(
+            size,
+            dY_data,
+            cur_X.template data<DstType>(),
+            cur_dw->template mutable_data<float>(),
+            &context_);
+      }
+    }
+
+    return true;
+  }
+
+  bool RunOnDevice() override;
+
+ private:
+  bool grad_on_w_;
+};
+
 /**
  * @brief Update slices of the tensor in-place with weighted sum.
  *
@@ -606,10 +662,18 @@ class ScatterAssignOp : public Operator<Context> {
                    &ScatterAssignOp::DoRun<int32_t, float>},
                   {{TensorProto_DataType_INT32, TensorProto_DataType_FLOAT16},
                    &ScatterAssignOp::DoRun<int32_t, float16>},
+                  {{TensorProto_DataType_INT32, TensorProto_DataType_INT32},
+                   &ScatterAssignOp::DoRun<int32_t, int32_t>},
+                  {{TensorProto_DataType_INT32, TensorProto_DataType_INT64},
+                   &ScatterAssignOp::DoRun<int32_t, int64_t>},
                   {{TensorProto_DataType_INT64, TensorProto_DataType_FLOAT},
                    &ScatterAssignOp::DoRun<int64_t, float>},
                   {{TensorProto_DataType_INT64, TensorProto_DataType_FLOAT16},
-                   &ScatterAssignOp::DoRun<int64_t, float16>}}) {}
+                   &ScatterAssignOp::DoRun<int64_t, float16>},
+                  {{TensorProto_DataType_INT64, TensorProto_DataType_INT32},
+                   &ScatterAssignOp::DoRun<int64_t, int32_t>},
+                  {{TensorProto_DataType_INT64, TensorProto_DataType_INT64},
+                   &ScatterAssignOp::DoRun<int64_t, int64_t>}}) {}
 
   bool RunOnDevice() override {
     const auto& data = Input(DATA);
@@ -668,6 +732,17 @@ class ScatterAssignOp : public Operator<Context> {
     T* data = output->template mutable_data<T>();
     const Index* idxs = indices.template data<Index>();
     const T* slicesData = slices.template data<T>();
+    DoScatterAssign(data, idxs, slicesData, N, K, block_size);
+  }
+
+  template <typename Index, typename T>
+  void DoScatterAssign(
+      T* data,
+      const Index* idxs,
+      const T* slicesData,
+      TIndex N,
+      TIndex K,
+      TIndex block_size) {
     for (int i = 0; i < K; ++i) {
       Index idx = idxs[i];
       // double-checking the indices, but it's fine as it's DCHECK only

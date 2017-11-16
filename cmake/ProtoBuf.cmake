@@ -1,6 +1,7 @@
 # Finds Google Protocol Buffers library and compilers and extends
 # the standard cmake script with version and python generation support
 function(custom_protobuf_find)
+  set(CAFFE2_USE_CUSTOM_PROTOBUF ON PARENT_SCOPE)
   message(STATUS "Use custom protobuf build.")
   # For a custom protobuf build, we will always use static protobuf.
   option(protobuf_BUILD_SHARED_LIBS "" OFF)
@@ -41,16 +42,16 @@ if (WIN32)
   find_package(Protobuf NO_MODULE)
 elseif (ANDROID OR IOS)
   custom_protobuf_find()
-  if (IOS_PLATFORM STREQUAL "WATCHOS")
-    # Unfortunately, WatchOS does not support building libprotoc and protoc,
-    # so we will need to exclude it. The problem of using EXCLUDE_FROM_ALL is
-    # that one is not going to be able to run cmake install. A proper solution
-    # has to be implemented by protobuf since we derive our cmake files from
-    # there.
-    set_target_properties(
-        libprotoc protoc PROPERTIES
-        EXCLUDE_FROM_ALL 1 EXCLUDE_FROM_DEFAULT_BUILD 1)
-  endif()
+  # Unfortunately, new protobuf does not support libprotoc and protoc
+  # cross-compilation so we will need to exclude it.
+  # The problem of using EXCLUDE_FROM_ALL is that one is not going to be able
+  # to run cmake install. A proper solution has to be implemented by protobuf
+  # since we derive our cmake files from there.
+  # TODO(jiayq): change this once https://github.com/google/protobuf/pull/3878
+  # merges.
+  set_target_properties(
+      libprotoc protoc PROPERTIES
+      EXCLUDE_FROM_ALL 1 EXCLUDE_FROM_DEFAULT_BUILD 1)
 else()
   # Always use libprotobuf from tree if a custom PROTOBUF
   if(EXISTS "${CAFFE2_CUSTOM_PROTOC_EXECUTABLE}")

@@ -67,11 +67,10 @@ struct ScratchWorkspaces {
 };
 
 inline void UpdateTimestepBlob(Workspace* ws, std::string blob_name, int t) {
-  ws->CreateBlob(blob_name)->template GetMutable<TensorCPU>()->Resize(1);
+  ws->CreateBlob(blob_name)->GetMutable<TensorCPU>()->Resize(1);
   auto timestepBlob = ws->GetBlob(blob_name);
   CAFFE_ENFORCE(timestepBlob);
-  timestepBlob->template GetMutable<TensorCPU>()
-      ->template mutable_data<int32_t>()[0] = t;
+  timestepBlob->GetMutable<TensorCPU>()->mutable_data<int32_t>()[0] = t;
 }
 
 std::map<string, string> GetRecurrentMapping(
@@ -228,6 +227,14 @@ class RecurrentNetworkOp final : public Operator<Context> {
     }
   }
 
+  size_t NumObservers() override {
+    size_t num = this->observers_.size();
+    if (rnnExecutor_) {
+      num += rnnExecutor_->NumObserversStepNet();
+    }
+    return num;
+  }
+
   std::vector<detail::RecurrentInput> constructRecurrentInputs(
       const OperatorDef& operator_def,
       Workspace* sharedWs) {
@@ -361,7 +368,8 @@ class RecurrentNetworkOp final : public Operator<Context> {
           // Need to limit timestep parallelism because we cycle over workspaces
           rnnExecutor_->SetMaxParallelTimesteps(num_workspaces_on_fwd_only);
         }
-        rnnExecutor_->EnsureTimestepInitialized(t, currentStepWorkspace.get());
+        rnnExecutor_->EnsureTimestepInitialized(
+            t, currentStepWorkspace.get(), this->observers_);
       } else {
         // Use plain Caffe2 nets
         detail::UpdateTimestepBlob(currentStepWorkspace.get(), timestep_, t);
@@ -386,7 +394,7 @@ class RecurrentNetworkOp final : public Operator<Context> {
     return true;
   }
 
-  bool RunOnDevice() {
+  bool RunOnDevice() override {
     return DoRunWithType<float>();
   }
 
@@ -753,7 +761,8 @@ class RecurrentNetworkGradientOp final : public Operator<Context> {
     }
     for (int32_t t = seqLen - 1; t >= 0; --t) {
       if (rnnExecutor_) {
-        rnnExecutor_->EnsureTimestepInitialized(t, stepWorkspaces[t].get());
+        rnnExecutor_->EnsureTimestepInitialized(
+            t, stepWorkspaces[t].get(), this->observers_);
       } else {
         auto* stepNet = stepWorkspaces[t].get()->GetNet(stepNetDef_.name());
         if (stepNet == nullptr) {
@@ -816,7 +825,7 @@ class RecurrentNetworkGradientOp final : public Operator<Context> {
     return true;
   }
 
-  bool RunOnDevice() {
+  bool RunOnDevice() override {
     return DoRunWithType<float>();
   }
 
