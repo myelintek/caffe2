@@ -181,6 +181,7 @@ def RunEpoch(
     # TODO: add loading from checkpoint
     log.info("Starting epoch {}/{}".format(epoch, args.num_epochs))
     epoch_iters = int(args.epoch_size / total_batch_size / num_shards)
+    T1 = time.time()
     for i in range(epoch_iters):
         # This timeout is required (temporarily) since CUDA-NCCL
         # operators might deadlock when synchronizing between GPUs.
@@ -208,6 +209,11 @@ def RunEpoch(
     learning_rate = workspace.FetchBlob(
         data_parallel_model.GetLearningRateBlobNames(train_model)[0]
     )
+    T2 = time.time()
+    Dt = T2 - T1
+    fmt = "Finished total iteration {} ({:.2f} images/sec)"
+    log.info(fmt.format(epoch_iters, epoch_iters * total_batch_size / Dt))
+
     test_accuracy = 0
     if (test_model is not None):
         # Run 100 iters of testing
