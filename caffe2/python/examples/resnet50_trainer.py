@@ -28,7 +28,6 @@ import os
 from caffe2.python import core, workspace, experiment_util, data_parallel_model
 from caffe2.python import dyndep, optimizer
 from caffe2.python import timeout_guard, model_helper, brew
-from caffe2.proto import caffe2_pb2
 
 import caffe2.python.models.resnet as resnet
 from caffe2.python.modeling.initializers import Initializer, pFP16Initializer
@@ -90,15 +89,12 @@ def AddNullInput(model, reader, batch_size, img_size, dtype):
     input. A label blob is hardcoded to a single value. This is useful if you
     want to test compute throughput or don't have a dataset available.
     '''
-    suffix = "_fp16" if dtype == "float16" else ""
     model.param_init_net.GaussianFill(
         [],
-        ["data" + suffix],
+        ["data"],
         shape=[batch_size, 3, img_size, img_size],
+        dtype=dtype,
     )
-    if dtype == "float16":
-        model.param_init_net.FloatToHalf("data" + suffix, "data")
-
     model.param_init_net.ConstantFill(
         [],
         ["label"],
@@ -151,17 +147,8 @@ def LoadModel(path, model):
 
     predict_init_net.RunAllOnGPU()
     init_net.RunAllOnGPU()
-
     assert workspace.RunNetOnce(predict_init_net)
     assert workspace.RunNetOnce(init_net)
-
-    # Hack: fix iteration counter which is in CUDA context after load model
-    itercnt = workspace.FetchBlob("optimizer_iteration")
-    workspace.FeedBlob(
-        "optimizer_iteration",
-        itercnt,
-        device_option=core.DeviceOption(caffe2_pb2.CPU, 0)
-    )
 
 
 def RunEpoch(
@@ -192,15 +179,16 @@ def RunEpoch(
             t2 = time.time()
             dt = t2 - t1
 
-        fmt = "Finished iteration {}/{} of epoch {} ({:.2f} images/sec)"
-        log.info(fmt.format(i + 1, epoch_iters, epoch, total_batch_size / dt))
-        prefix = "{}_{}".format(
-            train_model._device_prefix,
-            train_model._devices[0])
-        accuracy = workspace.FetchBlob(prefix + '/accuracy')
-        loss = workspace.FetchBlob(prefix + '/loss')
-        train_fmt = "Training loss: {}, accuracy: {}"
-        log.info(train_fmt.format(loss, accuracy))
+        if i%40 == 0:
+            fmt = "Finished iteration {}/{} of epoch {} ({:.2f} images/sec)"
+            log.info(fmt.format(i + 1, epoch_iters, epoch, total_batch_size / dt))
+            prefix = "{}_{}".format(
+                train_model._device_prefix,
+                train_model._devices[0])
+            accuracy = workspace.FetchBlob(prefix + '/accuracy')
+            loss = workspace.FetchBlob(prefix + '/loss')
+            train_fmt = "Training loss: {}, accuracy: {}"
+            log.info(train_fmt.format(loss, accuracy))
 
     num_images = epoch * epoch_iters * total_batch_size
     prefix = "{}_{}".format(train_model._device_prefix, train_model._devices[0])
@@ -347,8 +335,7 @@ def Train(args):
         with brew.arg_scope([brew.conv, brew.fc],
                             WeightInitializer=initializer,
                             BiasInitializer=initializer,
-                            enable_tensor_core=args.enable_tensor_core,
-                            float16_compute=args.float16_compute):
+                            enable_tensor_core=args.enable_tensor_core):
             pred = resnet.create_resnet50(
                 model,
                 "data",
@@ -369,30 +356,16 @@ def Train(args):
 
     def add_optimizer(model):
         stepsz = int(30 * args.epoch_size / total_batch_size / num_shards)
-
-        if args.float16_compute:
-            # TODO: merge with multi-prceision optimizer
-            opt = optimizer.build_fp16_sgd(
-                model,
-                args.base_learning_rate,
-                momentum=0.9,
-                nesterov=1,
-                weight_decay=args.weight_decay,   # weight decay included
-                policy="step",
-                stepsize=stepsz,
-                gamma=0.1
-            )
-        else:
-            optimizer.add_weight_decay(model, args.weight_decay)
-            opt = optimizer.build_multi_precision_sgd(
-                model,
-                args.base_learning_rate,
-                momentum=0.9,
-                nesterov=1,
-                policy="step",
-                stepsize=stepsz,
-                gamma=0.1
-            )
+        optimizer.add_weight_decay(model, args.weight_decay)
+        opt = optimizer.build_multi_precision_sgd(
+            model,
+            args.base_learning_rate,
+            momentum=0.9,
+            nesterov=1,
+            policy="step",
+            stepsize=stepsz,
+            gamma=0.1
+        )
         return opt
 
     # Define add_image_input function.
@@ -561,7 +534,7 @@ def main():
                         help="Number of GPU devices (instead of --gpus)")
     parser.add_argument("--num_channels", type=int, default=3,
                         help="Number of color channels")
-    parser.add_argument("--image_size", type=int, default=227,
+    parser.add_argument("--image_size", type=int, default=224,
                         help="Input image size (to crop to)")
     parser.add_argument("--num_labels", type=int, default=1000,
                         help="Number of labels")
@@ -598,8 +571,6 @@ def main():
     parser.add_argument('--dtype', default='float',
                         choices=['float', 'float16'],
                         help='Data type used for training')
-    parser.add_argument('--float16_compute', action='store_true',
-                        help="Use float 16 compute, if available")
     parser.add_argument('--enable-tensor-core', action='store_true',
                         help='Enable Tensor Core math for Conv and FC ops')
     parser.add_argument("--distributed_transport", type=str, default="tcp",

@@ -168,6 +168,7 @@ def RunEpoch(
     # TODO: add loading from checkpoint
     log.info("Starting epoch {}/{}".format(epoch, args.num_epochs))
     epoch_iters = int(args.epoch_size / total_batch_size / num_shards)
+    T1 = time.time()
     for i in range(epoch_iters):
         # This timeout is required (temporarily) since CUDA-NCCL
         # operators might deadlock when synchronizing between GPUs.
@@ -178,15 +179,16 @@ def RunEpoch(
             t2 = time.time()
             dt = t2 - t1
 
-        fmt = "Finished iteration {}/{} of epoch {} ({:.2f} images/sec)"
-        log.info(fmt.format(i + 1, epoch_iters, epoch, total_batch_size / dt))
-        prefix = "{}_{}".format(
-            train_model._device_prefix,
-            train_model._devices[0])
-        accuracy = workspace.FetchBlob(prefix + '/accuracy')
-        loss = workspace.FetchBlob(prefix + '/loss')
-        train_fmt = "Training loss: {}, accuracy: {}"
-        log.info(train_fmt.format(loss, accuracy))
+        if i%40 == 0:
+            fmt = "Finished iteration {}/{} of epoch {} ({:.2f} images/sec)"
+            log.info(fmt.format(i + 1, epoch_iters, epoch, total_batch_size / dt))
+            prefix = "{}_{}".format(
+                train_model._device_prefix,
+                train_model._devices[0])
+            accuracy = workspace.FetchBlob(prefix + '/accuracy')
+            loss = workspace.FetchBlob(prefix + '/loss')
+            train_fmt = "Training loss: {}, accuracy: {}"
+            log.info(train_fmt.format(loss, accuracy))
 
     num_images = epoch * epoch_iters * total_batch_size
     prefix = "{}_{}".format(train_model._device_prefix, train_model._devices[0])
@@ -195,6 +197,11 @@ def RunEpoch(
     learning_rate = workspace.FetchBlob(
         data_parallel_model.GetLearningRateBlobNames(train_model)[0]
     )
+    T2 = time.time()
+    Dt = T2 - T1
+    fmt = "Finished total iteration {} ({:.2f} images/sec)"
+    log.info(fmt.format(epoch_iters, epoch_iters * total_batch_size / Dt))
+
     test_accuracy = 0
     if (test_model is not None):
         # Run 100 iters of testing
@@ -412,6 +419,7 @@ def Train(args):
         rendezvous=rendezvous,
         optimize_gradient_memory=True,
         cpu_device=args.use_cpu,
+        use_nccl=True,
         shared_model=args.use_cpu,
     )
 
@@ -454,6 +462,7 @@ def Train(args):
             post_sync_builder_fun=add_post_sync_ops,
             param_update_builder_fun=None,
             devices=gpus,
+            use_nccl=True,
             cpu_device=args.use_cpu,
         )
         workspace.RunNetOnce(test_model.param_init_net)
