@@ -437,6 +437,7 @@ def Train(args):
         optimizer_builder_fun=add_optimizer,
         post_sync_builder_fun=add_post_sync_ops,
         devices=gpus,
+        use_nccl=True,
         rendezvous=rendezvous,
         optimize_gradient_memory=True,
         cpu_device=args.use_cpu,
