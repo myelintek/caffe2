@@ -1,7 +1,5 @@
 # Copyright (c) 2016-present, Facebook, Inc.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -26,8 +24,8 @@ import time
 import os
 
 from caffe2.python import core, workspace, experiment_util, data_parallel_model
-from caffe2.python import data_parallel_model_utils, dyndep, optimizer
-from caffe2.python import timeout_guard, model_helper, brew
+from caffe2.python import dyndep, optimizer
+from caffe2.python import timeout_guard, model_helper, brew, net_drawer
 from caffe2.proto import caffe2_pb2
 
 import caffe2.python.models.resnet as resnet
@@ -60,6 +58,31 @@ log.setLevel(logging.DEBUG)
 dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:file_store_handler_ops')
 dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:redis_store_handler_ops')
 
+#Danny's experiment
+def createLeNetModel(model):
+    '''
+    This part is the standard LeNet model: from data to the softmax prediction.
+    
+    For each convolutional layer we specify dim_in - number of input channels
+    and dim_out - number or output channels. Also each Conv and MaxPool layer changes the
+    image size. For example, kernel of size 5 reduces each side of an image by 4.
+
+    While when we have kernel and stride sizes equal 2 in a MaxPool layer, it divides
+    each side in half.
+    '''
+    # Image size: 28 x 28 -> 24 x 24
+    conv1 = brew.conv(model, 'data', 'conv1', dim_in=1, dim_out=20, kernel=5)
+    # Image size: 24 x 24 -> 12 x 12
+    pool1 = brew.max_pool(model, conv1, 'pool1', kernel=2, stride=2)
+    # Image size: 12 x 12 -> 8 x 8
+    conv2 = brew.conv(model, pool1, 'conv2', dim_in=20, dim_out=50, kernel=5)
+    # Image size: 8 x 8 -> 4 x 4
+    pool2 = brew.max_pool(model, conv2, 'pool2', kernel=2, stride=2)
+    # 50 * 4 * 4 stands for dim_out from previous layer multiplied by the image size
+    fc3 = brew.fc(model, pool2, 'fc3', dim_in=50 * 4 * 4, dim_out=500)
+    fc3 = brew.relu(model, fc3, fc3)
+    pred = brew.fc(model, fc3, 'pred', 500, 10)
+    return pred
 
 def AddImageInput(model, reader, batch_size, img_size, dtype, is_test):
     '''
@@ -82,7 +105,7 @@ def AddImageInput(model, reader, batch_size, img_size, dtype, is_test):
     )
 
     data = model.StopGradient(data, data)
-
+    return data, label
 
 def AddNullInput(model, reader, batch_size, img_size, dtype):
     '''
@@ -168,6 +191,7 @@ def RunEpoch(
     args,
     epoch,
     train_model,
+    train_update_model,
     test_model,
     total_batch_size,
     num_shards,
@@ -188,6 +212,13 @@ def RunEpoch(
         with timeout_guard.CompleteInTimeOrDie(timeout):
             t1 = time.time()
             workspace.RunNet(train_model.net.Proto().name)
+            # Danny's experiment
+            # The condition of iter_size
+            if( args.iter_size == 1 or ( i and (i % args.iter_size == 0 ))):
+                workspace.RunNet(train_update_model.net.Proto().name)    
+                #print("iter=%d, LR=%s" % ( i, 
+                #    (base_lr if i < iter_size else workspace.FetchBlob('LR'))
+                #))
             t2 = time.time()
             dt = t2 - t1
 
@@ -273,6 +304,10 @@ def Train(args):
     }
     train_model = model_helper.ModelHelper(
         name="resnet50", arg_scope=train_arg_scope
+    )
+    # Danny experiment
+    train_update_model = model_helper.ModelHelper(
+        name="resnet50_update", arg_scope=train_arg_scope
     )
 
     num_shards = args.num_shards
@@ -361,7 +396,31 @@ def Train(args):
         brew.accuracy(model, [softmax, "label"], "accuracy")
         return [loss]
 
-    def add_optimizer(model):
+
+   # Model building functions
+    def create_lenet_model_ops(model, loss_scale):
+        initializer = (pFP16Initializer if args.dtype == 'float16'
+                       else Initializer)
+
+        with brew.arg_scope([brew.conv, brew.fc],
+                            WeightInitializer=initializer,
+                            BiasInitializer=initializer,
+                            enable_tensor_core=args.enable_tensor_core,
+                            float16_compute=args.float16_compute):
+            pred = createLeNetModel(model)
+
+        if args.dtype == 'float16':
+            pred = model.net.HalfToFloat(pred, pred + '_fp32')
+
+        softmax, loss = model.SoftmaxWithLoss([pred, 'label'],
+                                              ['softmax', 'loss'])
+        loss = model.Scale(loss, scale=loss_scale)
+        brew.accuracy(model, [softmax, "label"], "accuracy")
+
+        return [loss]
+
+
+    def add_optimizer(model, model2):
         stepsz = int(30 * args.epoch_size / total_batch_size / num_shards)
 
         if args.float16_compute:
@@ -377,9 +436,10 @@ def Train(args):
                 gamma=0.1
             )
         else:
-            optimizer.add_weight_decay(model, args.weight_decay)
+            optimizer.add_weight_decay(model, model2, args.weight_decay)
             opt = optimizer.build_multi_precision_sgd(
                 model,
+                model2,
                 args.base_learning_rate,
                 momentum=0.9,
                 nesterov=1,
@@ -432,31 +492,25 @@ def Train(args):
     # Create parallelized model
     data_parallel_model.Parallelize(
         train_model,
+        train_update_model, # Danny's experiment
         input_builder_fun=add_image_input,
+        #forward_pass_builder_fun=create_lenet_model_ops,
         forward_pass_builder_fun=create_resnet50_model_ops,
         optimizer_builder_fun=add_optimizer,
         post_sync_builder_fun=add_post_sync_ops,
         devices=gpus,
         rendezvous=rendezvous,
-        optimize_gradient_memory=False,
+        optimize_gradient_memory=True,
         cpu_device=args.use_cpu,
         shared_model=args.use_cpu,
+        use_nccl=True,
+        iter_size=args.iter_size, # Danny's experiment
     )
 
-    if args.model_parallel:
-        # Shift half of the activations to another GPU
-        assert workspace.NumCudaDevices() >= 2 * args.num_gpus
-        activations = data_parallel_model_utils.GetActivationBlobs(train_model)
-        data_parallel_model_utils.ShiftActivationDevices(
-            train_model,
-            activations=activations[len(activations) // 2:],
-            shifts={g: args.num_gpus + g for g in range(args.num_gpus)},
-        )
-
-    data_parallel_model.OptimizeGradientMemory(train_model, {}, set(), False)
-
     workspace.RunNetOnce(train_model.param_init_net)
+    workspace.RunNetOnce(train_update_model.param_init_net)
     workspace.CreateNet(train_model.net)
+    workspace.CreateNet(train_update_model.net)
 
     # Add test model, if specified
     test_model = None
@@ -489,6 +543,7 @@ def Train(args):
 
         data_parallel_model.Parallelize(
             test_model,
+            test_model,
             input_builder_fun=test_input_fn,
             forward_pass_builder_fun=create_resnet50_model_ops,
             post_sync_builder_fun=add_post_sync_ops,
@@ -498,6 +553,16 @@ def Train(args):
         )
         workspace.RunNetOnce(test_model.param_init_net)
         workspace.CreateNet(test_model.net)
+    ''' 
+    #Danny's computation graph drawing
+    from IPython import display
+    graph = net_drawer.GetPydotGraph(train_model.net.Proto().op, "train_model", rankdir="graphs")
+    with open("/home/liudanny/parallel_train_model.png", "wb") as png:
+        png.write(graph.create_png())
+    graph = net_drawer.GetPydotGraph(train_update_model.net.Proto().op, "train_update_model", rankdir="graphs")
+    with open("/home/liudanny/parallel_train_update_model.png", "wb") as png:
+        png.write(graph.create_png())
+    '''
 
     epoch = 0
     # load the pre-trained model and reset epoch
@@ -530,6 +595,7 @@ def Train(args):
             args,
             epoch,
             train_model,
+            train_update_model,
             test_model,
             total_batch_size,
             num_shards,
@@ -564,8 +630,6 @@ def main():
                         help="Comma separated list of GPU devices to use")
     parser.add_argument("--num_gpus", type=int, default=1,
                         help="Number of GPU devices (instead of --gpus)")
-    parser.add_argument("--model_parallel", type=bool, default=False,
-                        help="Split model over 2 x num_gpus")
     parser.add_argument("--num_channels", type=int, default=3,
                         help="Number of color channels")
     parser.add_argument("--image_size", type=int, default=227,
@@ -613,6 +677,8 @@ def main():
                         help="Transport to use for distributed run [tcp|ibverbs]")
     parser.add_argument("--distributed_interfaces", type=str, default="",
                         help="Network interfaces to use for distributed run")
+    parser.add_argument("--iter_size", type=int, default=1,
+                        help="The iter size for gradient accumulation")
 
     args = parser.parse_args()
 
