@@ -988,13 +988,14 @@ def _calc_norm_ratio(
 
 def _build(
     model,
+    model2,
     optimizer,
     weights_only=False,
     use_param_info_optim=True,
     max_gradient_norm=None,
     allow_lr_injection=False,
 ):
-    param_to_device = _get_param_to_device(model)
+    param_to_device = _get_param_to_device(model2)
 
     # Validate there are no duplicate params
     model.Validate()
@@ -1004,6 +1005,7 @@ def _build(
         if weights_only and param_info.blob not in model.weights:
             continue
         params.append(param_info)
+    #print("params: {}\n", params)
 
     lr_multiplier = None
     if max_gradient_norm is not None:
@@ -1043,13 +1045,13 @@ def _build(
 
         with core.DeviceScope(device):
             if param_info.optimizer and use_param_info_optim:
-                param_info.optimizer(model.net, model.param_init_net, param_info)
+                param_info.optimizer(model2.net, model2.param_init_net, param_info)
             else:
-                optimizer(model.net, model.param_init_net, param_info)
+                optimizer(model2.net, model2.param_init_net, param_info)
     return optimizer
 
 
-def add_weight_decay(model, weight_decay):
+def add_weight_decay(model, model2, weight_decay):
     """Adds a decay to weights in the model.
 
     This is a form of L2 regularization.
@@ -1059,6 +1061,7 @@ def add_weight_decay(model, weight_decay):
     """
     _build(
         model,
+        model2,
         WeightDecayBuilder(weight_decay=weight_decay),
         weights_only=True,
         use_param_info_optim=False,
@@ -1067,6 +1070,7 @@ def add_weight_decay(model, weight_decay):
 
 def build_sgd(
     model,
+    model2,
     base_learning_rate,
     max_gradient_norm=None,
     allow_lr_injection=False,
@@ -1075,6 +1079,7 @@ def build_sgd(
     sgd_optimizer = SgdOptimizer(base_learning_rate, **kwargs)
     return _build(
         model,
+        model2,
         sgd_optimizer,
         max_gradient_norm=max_gradient_norm,
         allow_lr_injection=allow_lr_injection,
@@ -1083,6 +1088,7 @@ def build_sgd(
 
 def build_multi_precision_sgd(
     model,
+    model2,
     base_learning_rate,
     max_gradient_norm=None,
     allow_lr_injection=False,
@@ -1093,6 +1099,7 @@ def build_multi_precision_sgd(
     )
     return _build(
         model,
+        model2,
         multi_prec_sgd_optimizer,
         max_gradient_norm=max_gradient_norm,
         allow_lr_injection=allow_lr_injection,
@@ -1116,6 +1123,7 @@ def build_ftrl(model, engine="SIMD", **kwargs):
 
 def build_adagrad(
     model,
+    model2,
     base_learning_rate,
     parameters=None,
     max_gradient_norm=None,
@@ -1125,6 +1133,7 @@ def build_adagrad(
     adagrad_optimizer = AdagradOptimizer(alpha=base_learning_rate, **kwargs)
     return _build(
         model,
+        model2,
         adagrad_optimizer,
         max_gradient_norm=max_gradient_norm,
         allow_lr_injection=allow_lr_injection,
@@ -1133,6 +1142,7 @@ def build_adagrad(
 
 def build_adam(
     model,
+    model2,
     base_learning_rate,
     max_gradient_norm=None,
     allow_lr_injection=False,
@@ -1141,6 +1151,7 @@ def build_adam(
     adam_optimizer = AdamOptimizer(alpha=base_learning_rate, **kwargs)
     return _build(
         model,
+        model2,
         adam_optimizer,
         max_gradient_norm=max_gradient_norm,
         allow_lr_injection=allow_lr_injection,
@@ -1156,6 +1167,7 @@ def build_yellowfin(model, base_learning_rate=0.1, **kwargs):
 
 def build_rms_prop(
     model,
+    model2,
     base_learning_rate,
     max_gradient_norm=None,
     allow_lr_injection=False,
@@ -1164,6 +1176,7 @@ def build_rms_prop(
     rms_prop_optimizer = RmsPropOptimizer(alpha=base_learning_rate, **kwargs)
     return _build(
         model,
+        model2,
         rms_prop_optimizer,
         max_gradient_norm=max_gradient_norm,
         allow_lr_injection=allow_lr_injection,
