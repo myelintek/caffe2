@@ -108,7 +108,7 @@ def AddImageInput(model, reader, batch_size, img_size, dtype, is_test):
     )
 
     data = model.StopGradient(data, data)
-    return data, label
+    #return data, label
 
 
 def AddNullInput(model, reader, batch_size, img_size, dtype):
@@ -488,8 +488,7 @@ def Train(args):
         optimize_gradient_memory=False,
         cpu_device=args.use_cpu,
         shared_model=args.use_cpu,
-        use_nccl=True,
-        iter_size=args.iter_size, # Danny's experiment
+        iter_size=args.iter_size # Danny's experiment
     )
 
     if args.model_parallel:
@@ -551,7 +550,7 @@ def Train(args):
         workspace.RunNetOnce(test_model.param_init_net)
         workspace.CreateNet(test_model.net)
 
-"""
+    """
     #Danny's computation graph drawing
     from IPython import display
     graph = net_drawer.GetPydotGraph(train_model.net.Proto().op, "train_model", rankdir="graphs")
@@ -560,7 +559,7 @@ def Train(args):
     graph = net_drawer.GetPydotGraph(train_update_model.net.Proto().op, "train_update_model", rankdir="graphs")
     with open("/home/liudanny/parallel_train_update_model.png", "wb") as png:
         png.write(graph.create_png())
-"""
+    """
 
     epoch = 0
     # load the pre-trained model and reset epoch

@@ -70,6 +70,7 @@ def Parallelize(
     cpu_device=False,
     num_threads_per_device=4,
     shared_model=False,
+    iter_size=1,
 ):
     '''
     Function to create a model that can run on many GPUs or CPUs.
@@ -277,7 +278,7 @@ def Parallelize(
     param_grad_acc_names = []
     for device in devices:
         device_opt = core.DeviceOption(model_helper_obj2._device_type, device)
-       with core.DeviceScope(device_opt):
+        with core.DeviceScope(device_opt):
             with core.NameScope("{}_{}".format(model_helper_obj2._device_prefix,
                                                device)):
                 log.info("Model for {} : {}".format(device_name, device))
