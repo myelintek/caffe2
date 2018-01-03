@@ -39,6 +39,7 @@ import six
 
 # _known_working_ops are operators that do not need special care.
 _known_working_ops = [
+    "Accumulate",
     "Accuracy",
     "Adam",
     "Add",

@@ -25,6 +25,7 @@ import logging
 import copy
 
 from caffe2.python import model_helper, dyndep, scope, workspace, core, memonger
+from caffe2.python.modeling.initializers import Initializer
 from caffe2.proto import caffe2_pb2
 
 import numpy as np
@@ -51,6 +52,7 @@ def Parallelize_CPU(*args, **kwargs):
 
 def Parallelize(
     model_helper_obj,
+    model_helper_obj2,
     input_builder_fun,
     forward_pass_builder_fun,
     param_update_builder_fun=None,
@@ -68,6 +70,7 @@ def Parallelize(
     cpu_device=False,
     num_threads_per_device=4,
     shared_model=False,
+    iter_size=1,
 ):
     '''
     Function to create a model that can run on many GPUs or CPUs.
@@ -132,10 +135,15 @@ def Parallelize(
         model_helper_obj._device_prefix = "gpu"
         model_helper_obj._shared_model = False
         device_name = "GPU"
+        model_helper_obj2._device_type = caffe2_pb2.CUDA
+        model_helper_obj2._device_prefix = "gpu"
+        model_helper_obj2._shared_model = False
         assert shared_model is False, "Shared model only supported on CPU"
     else:
         model_helper_obj._device_type = caffe2_pb2.CPU
         model_helper_obj._device_prefix = "cpu"
+        model_helper_obj2._device_type = caffe2_pb2.CPU
+        model_helper_obj2._device_prefix = "cpu"
         device_name = "CPU"
         model_helper_obj._shared_model = shared_model
         if shared_model and rendezvous is not None:
@@ -148,12 +156,19 @@ def Parallelize(
         min(max_concurrent_distributed_ops, num_workers - 1)
     model_helper_obj.net.Proto().num_workers = num_workers
     model_helper_obj.net.Proto().type = net_type
+    model_helper_obj2.net.Proto().num_workers = num_workers
+    model_helper_obj2.net.Proto().type = net_type
 
     # Store some information in the model -- a bit ugly
     model_helper_obj._devices = devices
     model_helper_obj._rendezvous = rendezvous
     model_helper_obj._broadcast_context = None
     model_helper_obj._grad_names = []
+
+    model_helper_obj2._devices = devices
+    model_helper_obj2._rendezvous = rendezvous
+    model_helper_obj2._broadcast_context = None
+    model_helper_obj2._grad_names = []
 
     assert isinstance(model_helper_obj, model_helper.ModelHelper)
 
@@ -190,6 +205,7 @@ def Parallelize(
         log.warning('')
         # TODO: make into assert
 
+    
     for device in devices:
         device_opt = core.DeviceOption(model_helper_obj._device_type, device)
         with core.DeviceScope(device_opt):
@@ -253,6 +269,58 @@ def Parallelize(
 
     _InferBlobDevice(model_helper_obj)
 
+    '''
+    Danny's experiment
+    Step 1: Add accumulated gradient blobs
+    Step 2: Add Accumulate Op for accumulated gradient blobs
+    Step 3: Scale accumulated gradient blobs by iter_size
+    '''
+    reverse_ordered_grads = _GetReverseOrderedGrads(model_helper_obj)
+    param_grad_accs = []
+    param_grad_acc_names = []
+    for device in devices:
+        device_opt = core.DeviceOption(model_helper_obj2._device_type, device)
+        with core.DeviceScope(device_opt):
+            with core.NameScope("{}_{}".format(model_helper_obj2._device_prefix,
+                                               device)):
+                log.info("Model for {} : {}".format(device_name, device))
+
+                for param_grad in reverse_ordered_grads:
+                    param_grad_acc_name = param_grad + '_acc'
+                    param_grad_acc_obj = model_helper_obj2.create_param(
+                        param_name=param_grad_acc_name,
+                        shape=(), 
+                        #shape=model._infer_param_shape(param), 
+                        initializer=Initializer(operator_name='ConstantFill', value=0.0)
+                    )
+                    param_grad_accs.append(param_grad_acc_obj)
+                    param_grad_acc_names.append(param_grad_acc_name)
+                    # accumulate gradient to accumulate blob
+                    model_helper_obj.Accumulate(param_grad, param_grad_acc_name, gamma=1.0)
+    
+                    # scale accumulate blob that devide by iter_size, and store back to gradient blob
+                    model_helper_obj2.Scale(param_grad_acc_name, param_grad, scale = 1.0/iter_size)
+
+    '''
+    Danny's experiment
+    Step 4: setup the device grouped blobs for train_update_model
+    '''
+    # Group gradients by device and register to blob lookup
+    acc_grouped = _GroupByDevice(
+        model_helper_obj2,
+        devices,
+        param_grad_accs,
+        []
+    )
+    model_helper_obj2._device_grouped_blobs = acc_grouped
+    model_helper_obj2._acc_names = list(viewkeys(acc_grouped))
+    model_helper_obj2._losses_by_gpu = losses_by_gpu
+
+    _InferBlobDevice(model_helper_obj2)
+
+    #Danny's experiment
+    #print("acc_grouped: %s\n", acc_grouped)
+
     log.info("Add gradient all-reduces for SyncSGD")
     if broadcast_computed_params:
         _BroadcastComputedParams(devices, model_helper_obj, rendezvous, use_nccl)
@@ -266,12 +334,15 @@ def Parallelize(
             devices,
             model_helper_obj,
             model_helper_obj.net,
+            model_helper_obj2,
+            model_helper_obj2.net,
             rendezvous,
             use_nccl,
             max_concurrent_distributed_ops,
         )
     else:
         log.info("NOTE: Param builder function did not create any parameters.")
+
 
     log.info("Post-iteration operators for updating params")
     num_shards = 1 if rendezvous is None else rendezvous['num_shards']
@@ -290,8 +361,9 @@ def Parallelize(
                     param_update_builder_fun(model_helper_obj)
     else:
         log.info("Calling optimizer builder function")
-        optimizer = optimizer_builder_fun(model_helper_obj)
+        optimizer = optimizer_builder_fun(model_helper_obj, model_helper_obj2)
         model_helper_obj._optimizer = optimizer
+        model_helper_obj2._optimizer = optimizer
 
     (sync_blobs, sync_names) = _ComputeBlobsToSync(model_helper_obj)
     sync_blobs_grouped = _GroupByDevice(
@@ -304,6 +376,24 @@ def Parallelize(
 
     _InferBlobDevice(model_helper_obj)
     _AnalyzeOperators(model_helper_obj)
+
+    #Danny experiment 
+    '''
+    Danny's experiment
+    Step 4: Reset accumulate blob to zero
+    '''
+    for device in devices:
+        device_opt = core.DeviceOption(model_helper_obj2._device_type, device)
+        with core.DeviceScope(device_opt):
+            with core.NameScope("{}_{}".format(model_helper_obj2._device_prefix,
+                                               device)):
+                log.info("Model for {} : {}".format(device_name, device))
+
+                for param_grad_acc_name in param_grad_acc_names:
+                    # scale accumulate blob that devide by iter_size, and store back to gradient blob
+                    model_helper_obj2.Scale(param_grad_acc_name,
+                                            param_grad_acc_name, 
+                                            scale = 0.0)
 
     # Configure dagnet to run with only one worker on the first iteration,
     # to prevent concurrency problems with allocs and nccl.
@@ -365,6 +455,7 @@ def Parallelize_CPU_BMUF(*args, **kwargs):
 
 def Parallelize_BMUF(
     model_helper_obj,
+    model_helper_obj2,
     input_builder_fun,
     forward_pass_builder_fun,
     param_update_builder_fun,
@@ -557,6 +648,8 @@ def Parallelize_BMUF(
         devices,
         model_helper_obj,
         model_helper_obj._global_model_param_updates_net,
+        model_helper_obj2,
+        model_helper_obj2._global_model_param_updates_net,
         rendezvous,
         use_nccl,
         max_concurrent_distributed_ops
@@ -830,7 +923,7 @@ def FinalizeAfterCheckpoint(model, blobs=None):
         if blobs is None:
             (_, uniq_blob_names) = _ComputeBlobsToSync(model)
         else:
-            uniq_blob_names = [stripBlobName(p) for p in blobs]
+            uniq_blob_names = [stripParamName(p) for p in blobs]
 
         # Synchronize to the blob lookup map, as the provided
         # blobs might have non-parameters, such as momemtum blobs.
@@ -927,11 +1020,11 @@ def _Broadcast(devices, model, net, param, use_nccl=False):
             )
 
 
-def _AllReduce(devices, model, net, param, use_nccl=False, control_input=None):
+def _AllReduce(devices, model, net, model2, net2, param, use_nccl=False, control_input=None):
     blobs_group = list(viewvalues(model._device_grouped_blobs[param]))
     if model._device_type == caffe2_pb2.CUDA and use_nccl:
         # TODO: for _shared_model, do only NCCLReduce
-        model.NCCLAllreduce(
+        model2.NCCLAllreduce(
             blobs_group, blobs_group, control_input=control_input
         )
         return
@@ -958,13 +1051,13 @@ def _AllReduce(devices, model, net, param, use_nccl=False, control_input=None):
                 devices[0], peer
             ]:
                 # Copy from peer to d0
-                blobs[i] = model.Copy(
+                blobs[i] = model2.Copy(
                     blobs[i],
                     'gpu_{}/{}_gpu{}_copy'.format(devices[0], param, peer)
                 )
         device_opt = core.DeviceOption(model._device_type, devices[0])
         with core.DeviceScope(device_opt):
-            net.Sum(blobs, [blobs[0]], name='dpm')
+            net2.Sum(blobs, [blobs[0]], name='dpm')
 
     if len(devices) == 16:
         # Special tree reduction for 16 gpus, TODO generalize like in muji.py
@@ -988,7 +1081,7 @@ def _AllReduce(devices, model, net, param, use_nccl=False, control_input=None):
     else:
         sumN(*range(len(devices)))
     # TODO: for _shared_model, no need to broadcast
-    _Broadcast(devices, model, net, param)
+    _Broadcast(devices, model2, net2, param)
 
 
 def _SyncAllParams(
@@ -1128,7 +1221,8 @@ def _SyncAllParamsSingleHost(devices, model, net, unique_param_names):
         _Broadcast(devices, model, net, param)
 
 
-def _AllReduceBlobs(blob_names, devices, model, net, rendezvous, use_nccl,
+def _AllReduceBlobs(blob_names, devices, model, net, 
+                    model2, net2, rendezvous, use_nccl,
                     max_concurrent_distributed_ops):
     if rendezvous is None or rendezvous['num_shards'] <= 1:
         _AllReduceBlobsSingleHost(
@@ -1136,6 +1230,8 @@ def _AllReduceBlobs(blob_names, devices, model, net, rendezvous, use_nccl,
             devices,
             model,
             net,
+            model2,
+            net2,
             use_nccl
         )
     else:
@@ -1144,6 +1240,8 @@ def _AllReduceBlobs(blob_names, devices, model, net, rendezvous, use_nccl,
             devices,
             model,
             net,
+            model2,
+            net2,
             rendezvous,
             max_concurrent_distributed_ops,
         )
@@ -1189,7 +1287,7 @@ def _RemapParameterBlobsForSharedModel(model, all_params):
             # Remap inputs to point to the master param
             for j, inp in enumerate(op.input):
                 if inp in all_params and inp not in master_params:
-                    op.input[j] = master_prefix + stripBlobName(inp)
+                    op.input[j] = master_prefix + stripParamName(inp)
             ops.append(op)
         del net.Proto().op[:]
         net.Proto().op.extend(ops)
@@ -1305,13 +1403,13 @@ def _AllReduceBlobsDistributed(
                 model.ConstantFill(master_blob, reduced_blob, value=0.0)
 
                 # Temp fix since NCCLReduce does not work
-                net.NCCLAllreduce(
+                net2.NCCLAllreduce(
                     blobs_group,
                     blobs_group,
                     control_input=nccl_control_blob,
                 )
                 nccl_control_blob = blobs_group[0]
-                net.Copy(master_blob, reduced_blob)
+                net2.Copy(master_blob, reduced_blob)
 
             # Step 2: allreduce between all hosts, between master GPUs
             allreduce([reduced_blob])
@@ -1323,7 +1421,7 @@ def _AllReduceBlobsDistributed(
             _Broadcast(devices, model, net, blob_name)
 
 
-def _AllReduceBlobsSingleHost(blob_names, devices, model, net, use_nccl):
+def _AllReduceBlobsSingleHost(blob_names, devices, model, net, model2, net2, use_nccl):
     """Performs NCCL AllReduce to distribute blobs to all the GPUs."""
 
     if len(devices) == 1:
@@ -1346,7 +1444,7 @@ def _AllReduceBlobsSingleHost(blob_names, devices, model, net, use_nccl):
             with core.DeviceScope(master_device_opt):
                 if not isinstance(blobs_group[0], core.GradientSlice):
                     _AllReduce(
-                        devices, model, net, blob_name, use_nccl, last_out
+                        devices, model, net, model2, net2, blob_name, use_nccl, last_out
                     )
                     # last_out is used to serialize the execution of nccls
                     last_out = blobs_group[0]
@@ -1376,10 +1474,10 @@ def _AllReduceBlobsSingleHost(blob_names, devices, model, net, use_nccl):
                         for gpu, g in viewitems(model._device_grouped_blobs[blob_name]):
                             device_opt = core.DeviceOption(model._device_type, gpu)
                             with core.DeviceScope(device_opt):
-                                model.Copy(grad_idx_concat, g.indices)
+                                model2.Copy(grad_idx_concat, g.indices)
                                 concatenated_idx.add(g.indices)
 
-                    grad_val_concat, _ = net.Concat(
+                    grad_val_concat, _ = net2.Concat(
                         [g.values for g in blobs_group],
                         ["{}/{}_val_concat".format(master_ns, blob_name),
                          "{}/{}_val_splitinfo".format(master_ns, blob_name)],
@@ -1388,7 +1486,7 @@ def _AllReduceBlobsSingleHost(blob_names, devices, model, net, use_nccl):
                     for gpu, g in viewitems(model._device_grouped_blobs[blob_name]):
                         device_opt = core.DeviceOption(model._device_type, gpu)
                         with core.DeviceScope(device_opt):
-                            model.Copy(grad_val_concat, g.values)
+                            model2.Copy(grad_val_concat, g.values)
 
         else:
             assert not isinstance(blobs_group[0], core.GradientSlice), \
@@ -1397,7 +1495,7 @@ def _AllReduceBlobsSingleHost(blob_names, devices, model, net, use_nccl):
                 # Poor man's allreduce
                 net.Sum(blobs_group, [blobs_group[0]])
                 if not model._shared_model:
-                    _Broadcast(devices, model, net, blob_name)
+                    _Broadcast(devices, model2, net2, blob_name)
 
 
 def _BroadcastComputedParams(devices, model, rendezvous, use_nccl=False):
@@ -1439,10 +1537,10 @@ def _GetReverseOrderedGrads(model):
 
 
 # A helper function to extract a parameter's name
-def stripBlobName(param):
+def stripParamName(param):
     # Format is "a/b/c/d" -> "b/c/d"
     if isinstance(param, core.GradientSlice):
-        return stripBlobName(param.indices) + ":" + stripBlobName(param.values)
+        return stripParamName(param.indices) + ":" + stripParamName(param.values)
     else:
         name = str(param)
     return name[name.index(scope._NAMESCOPE_SEPARATOR) + 1:]
@@ -1535,7 +1633,7 @@ def _GroupByDevice(model, devices, params, non_data_params):
             isinstance(p, core.GradientSlice), \
             "Param {} is not BlobReference or GradientSlice".format(p)
 
-        name = stripBlobName(p)
+        name = stripParamName(p)
         gpuid = devices[i // num_params_per_device]
 
         if isinstance(p, core.BlobReference):
@@ -1591,7 +1689,7 @@ def _ComputeBlobsToSync(model):
     # We don't sync params if the model is shared
     if model._shared_model:
         blobs_to_sync = [str(p) for p in model.GetComputedParams('')]
-        sync_names = [stripBlobName(p) for p in blobs_to_sync]
+        sync_names = [stripParamName(p) for p in blobs_to_sync]
     else:
         blobs_to_sync = []
 
@@ -1600,7 +1698,7 @@ def _ComputeBlobsToSync(model):
                 o for o in op.output
                 if o.startswith("{}_".format(model._device_prefix))
             ]
-            sync_names.update([stripBlobName(o) for o in dp_outputs])
+            sync_names.update([stripParamName(o) for o in dp_outputs])
             blobs_to_sync.extend(dp_outputs)
 
         # Sanity check
